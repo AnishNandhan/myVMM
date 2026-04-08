@@ -18,7 +18,7 @@ int main (int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    rc = ioctl(kvm_fd, KVM_GET_API_VERSION);
+    rc = ioctl(kvm_fd, KVM_GET_API_VERSION, 0);
     if (rc < 0) {
         printf("ioctl error: %s\n", strerror(errno));
         return rc;
