@@ -12,7 +12,26 @@
 #include <unistd.h>
 
 #define KVM_FILE "/dev/kvm"
-#define PAGE_SIZE 0x1000    // define 4 KB page size
+#define PAGE_SIZE 0x1000       // define 4 KB page size
+
+#define MMIO_START 0x200000
+#define MMIO_SIZE 0xc00000
+
+#define UART_16550_START MMIO_START + 0x000000
+
+// 16550 UART Register Map
+#define RBR_16550 0x00   // Receiver Buffer Register
+#define THR_16550 0x01   // Transmitter Holding Register
+#define IER_16550 0x02   // Interrupt Enable Register
+#define IIR_16550 0x03   // Interrupt Identification Register
+#define FCR_16550 0x04   // FIFO Control Register
+#define LCR_16550 0x05   // Line Control Register
+#define MCR_16550 0x07   // MODEM Control Register
+#define LSR_16550 0x08   // Line Status Register
+#define MSR_16550 0x09   // MODEM Status Register
+#define SCR_16550 0x0a   // Scratch Register
+#define DLL_16550 0x0b   // Divisor Latch (LS)
+#define DLM_16550 0x0c   // Divisor Latch (LM)
 
 struct list_entry {
     int fd;
@@ -24,6 +43,34 @@ struct vm {
     SLIST_HEAD(vcpu_list_head, list_entry);
     SLIST_HEAD(device_list_head, list_entry);
 };
+
+struct mmio_access {
+    uint64_t phys_addr;
+    uint8_t data[8];
+    uint32_t len;
+    uint8_t is_write;
+};
+
+void uart_handler(struct mmio_access *mmio) {
+    printf("UART handler triggered\n");
+    if (mmio->is_write) {
+        // TODO: This prints out-of-order. Fix
+        printf("UART string received: ");
+        write(STDOUT_FILENO, (void*)mmio->data, mmio->len);
+        printf("\n");
+    }
+
+}
+
+void mmio_handler(struct mmio_access *mmio) {
+    printf("MMIO handler triggered.\n");
+    if (
+        mmio->phys_addr >= UART_16550_START &&
+        mmio->phys_addr < UART_16550_START + 0xc
+    ) {
+        uart_handler(mmio);
+    }
+}
 
 int main (int argc, char *argv[]) {
     int kvm_fd, rc;
@@ -65,33 +112,57 @@ int main (int argc, char *argv[]) {
     }
 
     int guest_file = open("/usr/lib/guest.img", O_RDONLY);
-    int guest_mem_size;
     struct stat st;
     if (guest_file == -1) {
         perror("open");
-        guest_mem_size = 0x1000000;
-    } else {
-        fstat(guest_file, &st);
-        ssize_t file_size = st.st_size;
-        guest_mem_size = file_size + (PAGE_SIZE - (file_size & (PAGE_SIZE - 1))); 
-    }
-
-    // Allocate page aligned memory
-    void *mem = mmap(NULL, guest_mem_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, guest_file, 0);
-    if (mem == MAP_FAILED) {
-        perror("mmap");
         exit(EXIT_FAILURE);
     }
 
-    struct kvm_userspace_memory_region mem_region = {
+    // Allocate 4MB page aligned memory
+    void *normal_mem = aligned_alloc(PAGE_SIZE, 0x200000);
+    if (normal_mem == NULL) {
+        perror("aligned alloc");
+        exit(EXIT_FAILURE);
+    }
+    memset(normal_mem, 0, 0x200000);  
+    fstat(guest_file, &st);
+    rc = read(guest_file, normal_mem, st.st_size);
+    if (rc < 0) {
+        perror("read");
+        exit(EXIT_FAILURE);
+    }
+
+    // Allocate 12MB page aligned memory
+    void *mmio_mem = aligned_alloc(PAGE_SIZE, 0xc00000);
+    if (mmio_mem == NULL) {
+        perror("aligned alloc");
+        exit(EXIT_FAILURE);
+    }
+    memset(mmio_mem, 0, 0xc00000);
+
+    struct kvm_userspace_memory_region normal_mem_region = {
         .slot = (uint32_t)0,                          // Slot number (this is like an index for memory regions assigned to a VM)
         .guest_phys_addr = (uint64_t)0x0,             // This memory will start at byte 0 in the guest
-        .memory_size = (uint64_t)guest_mem_size,      // Memory region size
-        .userspace_addr = (uint64_t)mem     // Pointer to userspace memory
+        .memory_size = (uint64_t)0x200000,      // Memory region size
+        .userspace_addr = (uint64_t)normal_mem     // Pointer to userspace memory
     };
 
     // Assign previously allocated memory to VM
-    rc = ioctl(vm_fd, KVM_SET_USER_MEMORY_REGION, &mem_region);
+    rc = ioctl(vm_fd, KVM_SET_USER_MEMORY_REGION, &normal_mem_region);
+    if (rc == -1) {
+        perror("KVM_SET_USER_MEMORY");
+        exit(EXIT_FAILURE);
+    }
+
+    struct kvm_userspace_memory_region mmio_mem_region = {
+        .slot = (uint32_t)1,
+        .flags = KVM_MEM_READONLY,
+        .guest_phys_addr = (uint64_t)0x200000,
+        .memory_size = (uint64_t)0xc00000,
+        .userspace_addr = (uint64_t)mmio_mem
+    };
+
+    rc = ioctl(vm_fd, KVM_SET_USER_MEMORY_REGION, &mmio_mem_region);
     if (rc == -1) {
         perror("KVM_SET_USER_MEMORY");
         exit(EXIT_FAILURE);
@@ -130,24 +201,36 @@ int main (int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
+    struct kvm_vcpu_init vcpu_init;
+    rc = ioctl(vm_fd, KVM_ARM_PREFERRED_TARGET, &vcpu_init);
+    if (rc == -1) {
+        perror("KVM_ARM_PREFERRED_TARGET");
+        exit(EXIT_FAILURE);
+    }
+
+    rc = ioctl(vcpu_fd, KVM_ARM_VCPU_INIT, &vcpu_init);
+    if (rc == -1) {
+        perror("KVM_ARM_VCPU_INIT");
+        exit(EXIT_FAILURE);
+    }
+
     while (1) {
         ioctl(vcpu_fd, KVM_RUN, NULL);
-        printf("Exit Reason: %d\n", run->exit_reason);
+        //printf("Exit Reason: %d\n", run->exit_reason);
 
         switch(run->exit_reason) {
             case KVM_EXIT_SYSTEM_EVENT:
                 printf("System event exit.\n");
                 return EXIT_SUCCESS;
-            case KVM_EXIT_UNKNOWN:
-                printf("Unkown exit reason. Hardware exit reason number: %lu\n", run->hw.hardware_exit_reason);
+            case KVM_EXIT_MMIO:
+                mmio_handler(&run->mmio);
                 break;
-            default:
-                printf("Invalid exit reason\n");
-                return EXIT_FAILURE;
-
         }
     }
 
+    free(normal_mem);
+    free(mmio_mem);
+    free(run);
 
     return EXIT_SUCCESS;
 }
