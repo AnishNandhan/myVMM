@@ -1,3 +1,6 @@
+#include <stdio.h>
+#include <uart.h>
+
 /*
     Needs to emulate 16550 UART:
         1. Use 115200 baud rate
@@ -20,4 +23,13 @@ struct uart_16550_buffers {
 struct uart_16550 {
     struct uart_16550_buffers buf;
 };
+
+void uart_handler(struct mmio_access *mmio) {
+    if (mmio->is_write) {
+        char s[mmio->len + 1];
+        s[mmio->len] = '\0';
+        printf("%s", s);
+    }
+}
+
 

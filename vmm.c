@@ -1,110 +1,32 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/kvm.h>
-#include <stdint.h>
+#include <linux/virtio_mmio.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
-#include <sys/queue.h>
-#include <unistd.h>
+#include <std.h>
+#include <virtio.h>
+#include <uart.h>
 
-#define KVM_FILE "/dev/kvm"
-#define PAGE_SIZE 0x1000       // define 4 KB page size
+static virtio_blk_device blk_dev;
 
-#define NORM_MEM_BASE 0x00000
-#define NORM_MEM_SIZE 0xc00000
+void init_virtio_blk_device(virtio_blk_device *blk_dev) {
+    memset(blk_dev, 0, sizeof(virtio_blk_device));
 
-#define MMIO_BASE 0xc00000
-#define MMIO_SIZE 0x400000
+    blk_dev->regs = (struct virtio_mmio_device_registers){
+        .magic_number = 0x74726976,
+        .version = 0x2,
+        .device_id = 0x2,
+        .vendor_id = 0x73696e61,   // LE for "anis"
+        .queue_num_max = 0x8,
+    };
+    blk_dev->regs.device_features = VIRTIO_SUPPORTED_FEATURES;
 
-#define UART_16550_BASE MMIO_BASE + 0x000000
-
-// 16550 UART Register Map
-#define RBR_16550 0x0   // Receiver Buffer Register
-#define THR_16550 0x0   // Transmitter Holding Register
-#define IER_16550 0x1   // Interrupt Enable Register
-#define IIR_16550 0x2   // Interrupt Identification Register
-#define FCR_16550 0x2   // FIFO Control Register
-#define LCR_16550 0x3   // Line Control Register
-#define MCR_16550 0x4   // MODEM Control Register
-#define LSR_16550 0x5   // Line Status Register
-#define MSR_16550 0x6   // MODEM Status Register
-#define SCR_16550 0x7   // Scratch Register
-#define DLL_16550 0x0   // Divisor Latch (LS)
-#define DLM_16550 0x1   // Divisor Latch (LM)
-
-#define VGIC_DIST_REGS_BASE 0x1000000
-#define VGIC_DIST_REGS_SIZE 0x1000
-#define VGIC_CPU_REGS_BASE (VGIC_DIST_REGS_BASE + VGIC_DIST_REGS_SIZE)
-#define VGIC_CPU_REGS_SIZE 0x2000
-
-// ARM GICv2 GICD register offsets
-enum {
-    GICD_CTLR,
-    GICD_TYPER,
-    GICD_IIDR,
-    GICD_IGROUPR0,
-    GICD_ISENABLER0,
-    GICD_ICENABLER0,
-    GICD_ISPENDR0,
-    GICD_ICPENDR0,
-    GICD_ISACTIVER0,
-    GICD_ICACTIVER0,
-    GICD_IPRIORITYR0,
-    GICD_ITARGETRR0,
-    GICD_ICFGR0,
-    GICD_NSACR0,
-    GICD_SGIR,
-    GICD_CPENDSGIR0,
-    GICD_SPENDSGIR0,
-};
-
-// ARM GICv2 GICC register offsets
-enum {
-    GICC_CTLR,
-    GICC_PMR,
-    GICC_BPR,
-    GICC_IAR,
-    GICC_,
-    GICC_EOIR,
-    GICC_RPR,
-    GICC_HIPPR,
-    GICC_ABPR,
-    GICC_AIAR,
-    GICC_AEOIR,
-    GICC_AHPPIR,
-    GICC_APR0,
-    GICC_NSAPR0,
-    GICC_IIDR,
-    GICC_DIR,
-};
-
-struct list_entry {
-    int fd;
-    SLIST_ENTRY(list_entry) entries;
-};
-
-struct vm {
-    int fd;
-    SLIST_HEAD(vcpu_list_head, list_entry);
-    SLIST_HEAD(device_list_head, list_entry);
-};
-
-struct mmio_access {
-    uint64_t phys_addr;
-    uint8_t data[8];
-    uint32_t len;
-    uint8_t is_write;
-};
-
-void uart_handler(struct mmio_access *mmio) {
-    if (mmio->is_write) {
-        write(STDOUT_FILENO, (void*)mmio->data, mmio->len);
-    }
-
+    blk_dev->config.capacity = (1U << 30);
+    blk_dev->config.blk_size = 4096;
 }
 
 void mmio_handler(struct mmio_access *mmio) {
@@ -113,6 +35,11 @@ void mmio_handler(struct mmio_access *mmio) {
         mmio->phys_addr < UART_16550_BASE + 0x8
     ) {
         uart_handler(mmio);
+    } else if (
+        mmio->phys_addr >= VIRTIO_BLK_BASE &&
+        mmio->phys_addr < VIRTIO_BLK_BASE + PAGE_SIZE
+    ) {
+        virtio_handler(mmio, &blk_dev);
     }
 }
 
@@ -212,18 +139,22 @@ int main (int argc, char *argv[]) {
     }
 
     // Allocate 4MB page aligned memory
-    void *mmio_mem = aligned_alloc(PAGE_SIZE, MMIO_SIZE);
-    if (mmio_mem == NULL) {
-        perror("aligned alloc");
-        exit(EXIT_FAILURE);
-    }
-    memset(mmio_mem, 0, MMIO_SIZE);
+    // void *mmio_mem = aligned_alloc(PAGE_SIZE, MMIO_SIZE);
+    // if (mmio_mem == NULL) {
+    //     perror("aligned alloc");
+    //     exit(EXIT_FAILURE);
+    // }
+    // memset(mmio_mem, 0, MMIO_SIZE);
 
     struct kvm_userspace_memory_region normal_mem_region = {
-        .slot = (uint32_t)0,                          // Slot number (this is like an index for memory regions assigned to a VM)
-        .guest_phys_addr = (uint64_t)NORM_MEM_BASE,             // This memory will start at byte 0 in the guest
-        .memory_size = (uint64_t)NORM_MEM_SIZE,      // Memory region size
-        .userspace_addr = (uint64_t)normal_mem     // Pointer to userspace memory
+        // Slot number (this is like an index for memory regions assigned to a VM)
+        .slot = (uint32_t)0,
+        // This memory will start at byte 0 in the guest                          
+        .guest_phys_addr = (uint64_t)NORM_MEM_BASE,
+        // Memory region size             
+        .memory_size = (uint64_t)NORM_MEM_SIZE,
+        // Pointer to userspace memory      
+        .userspace_addr = (uint64_t)normal_mem     
     };
 
     // Assign previously allocated memory to VM
@@ -233,19 +164,20 @@ int main (int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
-    struct kvm_userspace_memory_region mmio_mem_region = {
-        .slot = (uint32_t)1,
-        .flags = KVM_MEM_READONLY,
-        .guest_phys_addr = (uint64_t)MMIO_BASE,
-        .memory_size = (uint64_t)MMIO_SIZE,
-        .userspace_addr = (uint64_t)mmio_mem
-    };
+    // struct kvm_userspace_memory_region mmio_mem_region = {
+    //     .slot = (uint32_t)1,
+    //     // Use readonly flag to make writes to this region cause KVM_EXIT_MMIO
+    //     .flags = KVM_MEM_READONLY,
+    //     .guest_phys_addr = (uint64_t)MMIO_BASE,
+    //     .memory_size = (uint64_t)MMIO_SIZE,
+    //     .userspace_addr = (uint64_t)mmio_mem
+    // };
 
-    rc = ioctl(vm_fd, KVM_SET_USER_MEMORY_REGION, &mmio_mem_region);
-    if (rc == -1) {
-        perror("KVM_SET_USER_MEMORY");
-        exit(EXIT_FAILURE);
-    }
+    // rc = ioctl(vm_fd, KVM_SET_USER_MEMORY_REGION, &mmio_mem_region);
+    // if (rc == -1) {
+    //     perror("KVM_SET_USER_MEMORY");
+    //     exit(EXIT_FAILURE);
+    // }
     
     // Check maximum and recommended number of vCPUs for a VM
     int rec_vcpus, max_vcpus, max_vcpu_id;
@@ -275,7 +207,8 @@ int main (int argc, char *argv[]) {
     int vcpu_mmap_size = ioctl(kvm_fd, KVM_GET_VCPU_MMAP_SIZE, 0);
     printf("KVM VCPU MMAP SIZE: %d\n", vcpu_mmap_size);
 
-    struct kvm_run *run = mmap(NULL, vcpu_mmap_size, PROT_READ | PROT_WRITE, MAP_SHARED, vcpu_fd, 0); 
+    struct kvm_run *run = mmap(NULL, vcpu_mmap_size, 
+                            PROT_READ | PROT_WRITE, MAP_SHARED, vcpu_fd, 0); 
     if (run == MAP_FAILED) {
         perror("mmap");
         exit(EXIT_FAILURE);
@@ -290,9 +223,13 @@ int main (int argc, char *argv[]) {
         perror("KVM_CREATE_DEVICE");
         exit(EXIT_FAILURE);
     }
+
     configure_arm_vgic(arm_vgic.fd);
 
+    init_virtio_blk_device(&blk_dev);
+
     struct kvm_vcpu_init vcpu_init;
+    memset(&vcpu_init, 0, sizeof(vcpu_init));
     rc = ioctl(vm_fd, KVM_ARM_PREFERRED_TARGET, &vcpu_init);
     if (rc == -1) {
         perror("KVM_ARM_PREFERRED_TARGET");
@@ -307,22 +244,21 @@ int main (int argc, char *argv[]) {
 
     while (1) {
         ioctl(vcpu_fd, KVM_RUN, NULL);
-        //printf("Exit Reason: %d\n", run->exit_reason);
 
         switch(run->exit_reason) {
             case KVM_EXIT_SYSTEM_EVENT:
                 printf("System event exit.\n");
                 return EXIT_SUCCESS;
             case KVM_EXIT_MMIO:
-                mmio_handler(&run->mmio);
+                mmio_handler((struct mmio_access*)&run->mmio);
                 break;
             default:
-                printf("Unknown exit reason\n");
+                printf("Unknown exit reason: %d\n", run->exit_reason);
         }
     }
 
     free(normal_mem);
-    free(mmio_mem);
+    // free(mmio_mem);
     free(run);
 
     return EXIT_SUCCESS;
