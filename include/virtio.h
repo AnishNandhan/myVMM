@@ -30,6 +30,13 @@
 #define VIRTIO_STATUS_DEVICE_NEEDS_RESET (1 << 6)
 #define VIRTIO_STATUS_FAILED (1 << 7)
 
+#define VIRTIO_BLK_MAX_NUM_QUEUE 1
+#define VIRTIO_BLK_SECTOR_SIZE 512
+
+#define VIRTIO_BLK_S_OK 0
+#define VIRTIO_BLK_S_IOERR 1
+#define VIRTIO_BLK_S_UNSUPP 2
+
 struct __attribute__((packed)) virtio_blk_config {
     le64 capacity;
     le32 size_max;
@@ -76,18 +83,10 @@ struct virtio_mmio_device_registers {
     uint32_t driver_features_sel;
     uint32_t queue_sel;
     uint32_t queue_num_max;
-    uint32_t queue_num;
-    uint32_t queue_ready;
     uint32_t queue_notify;
     uint32_t interrupt_status;
     uint32_t interrupt_ack;
     uint32_t status;
-    uint32_t queue_desc_low;
-    uint32_t queue_desc_high;
-    uint32_t queue_driver_low;
-    uint32_t queue_driver_high;
-    uint32_t queue_device_low;
-    uint32_t queue_device_high;
     uint32_t shm_sel;
     uint32_t shm_len_low;
     uint32_t shm_len_high;
@@ -97,10 +96,31 @@ struct virtio_mmio_device_registers {
     uint32_t config_generation;
 };
 
+struct virtioq_metadata {
+    uint32_t queue_size;
+    uint32_t queue_ready;
+    uint64_t queue_desc;
+    uint64_t queue_driver;
+    uint64_t queue_device;
+};
+
 typedef struct {
     struct virtio_mmio_device_registers regs;
     struct virtio_blk_config config;
+    struct virtioq_metadata q_stat[VIRTIO_BLK_MAX_NUM_QUEUE];
 } virtio_blk_device;
+
+struct __attribute__((packed))  virtio_blk_req_hdr {
+    le32 type;
+    le32 reserved;
+    le64 sector;
+};
+
+struct __attribute__((packed)) virtio_blk_req {
+    struct virtio_blk_req_hdr hdr;
+    uint8_t data[VIRTIO_BLK_SECTOR_SIZE];
+    uint8_t status;
+};
 
 void virtio_handler(struct mmio_access *mmio, virtio_blk_device *dev);
 
@@ -109,5 +129,7 @@ uint32_t virtio_status_write_handler(uint32_t new_status, virtio_blk_device *dev
 void virtio_write_handler(struct mmio_access *mmio, virtio_blk_device *dev);
 
 void virtio_read_handler(struct mmio_access *mmio, virtio_blk_device *dev);
+
+int virtio_blk_req_handler(uint64_t data, virtio_blk_device *dev);
 
 #endif // VIRTIO_H

@@ -97,4 +97,12 @@ struct mmio_access {
     uint8_t is_write;
 };
 
+extern void *normal_mem;
+
+extern int vm_fd;
+
+extern struct kvm_create_device arm_vgic;
+
+void get_vgic_attr(int fd, uint32_t group, uint32_t attr, uint64_t addr);
+
 #endif // STD_H

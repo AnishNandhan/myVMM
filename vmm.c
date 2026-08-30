@@ -1,3 +1,4 @@
+#include <stddef.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/kvm.h>
@@ -13,7 +14,14 @@
 
 static virtio_blk_device blk_dev;
 
+void *normal_mem;
+
+int vm_fd;
+
+struct kvm_create_device arm_vgic;
+
 void init_virtio_blk_device(virtio_blk_device *blk_dev) {
+    // Initialize all registers to zero
     memset(blk_dev, 0, sizeof(virtio_blk_device));
 
     blk_dev->regs = (struct virtio_mmio_device_registers){
@@ -25,14 +33,14 @@ void init_virtio_blk_device(virtio_blk_device *blk_dev) {
     };
     blk_dev->regs.device_features = VIRTIO_SUPPORTED_FEATURES;
 
-    blk_dev->config.capacity = (1U << 30);
+    blk_dev->config.capacity = (1U << 30) / VIRTIO_BLK_SECTOR_SIZE;
     blk_dev->config.blk_size = 4096;
 }
 
 void mmio_handler(struct mmio_access *mmio) {
     if (
         mmio->phys_addr >= UART_16550_BASE &&
-        mmio->phys_addr < UART_16550_BASE + 0x8
+        mmio->phys_addr < UART_16550_BASE + UART_16550_SIZE
     ) {
         uart_handler(mmio);
     } else if (
@@ -40,6 +48,8 @@ void mmio_handler(struct mmio_access *mmio) {
         mmio->phys_addr < VIRTIO_BLK_BASE + PAGE_SIZE
     ) {
         virtio_handler(mmio, &blk_dev);
+    } else {
+        printf("MMIO trap at unknown address. Doing nothing.\n");
     }
 }
 
@@ -76,6 +86,13 @@ void configure_arm_vgic(int dev_fd) {
         KVM_VGIC_V2_ADDR_TYPE_DIST, VGIC_DIST_REGS_BASE);
     set_vgic_attr(dev_fd, KVM_DEV_ARM_VGIC_GRP_ADDR, 
         KVM_VGIC_V2_ADDR_TYPE_CPU, VGIC_CPU_REGS_BASE);
+    set_vgic_attr(dev_fd, KVM_DEV_ARM_VGIC_GRP_NR_IRQS,
+        0, 64);
+}
+
+void init_arm_vgic(int dev_fd) {
+    set_vgic_attr(dev_fd, KVM_DEV_ARM_VGIC_GRP_CTRL,
+        KVM_DEV_ARM_VGIC_CTRL_INIT, 0);
 }
 
 int main (int argc, char *argv[]) {
@@ -106,7 +123,7 @@ int main (int argc, char *argv[]) {
     }
 
     // Create VM
-    int vm_fd = ioctl(kvm_fd, KVM_CREATE_VM, KVM_VM_TYPE_ARM_IPA_SIZE(32));
+    vm_fd = ioctl(kvm_fd, KVM_CREATE_VM, KVM_VM_TYPE_ARM_IPA_SIZE(32));
 
     rc = ioctl(vm_fd, KVM_CHECK_EXTENSION, KVM_CAP_USER_MEMORY);
     if (rc == -1) {
@@ -125,7 +142,7 @@ int main (int argc, char *argv[]) {
     }
 
     // Allocate 12MB page aligned memory
-    void *normal_mem = aligned_alloc(PAGE_SIZE, NORM_MEM_SIZE);
+    normal_mem = aligned_alloc(PAGE_SIZE, NORM_MEM_SIZE);
     if (normal_mem == NULL) {
         perror("aligned alloc");
         exit(EXIT_FAILURE);
@@ -214,20 +231,6 @@ int main (int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
-    // Create ARM vGIC (Generic Interrupt Controller)
-    struct kvm_create_device arm_vgic = {
-        .type = KVM_DEV_TYPE_ARM_VGIC_V2
-    };
-    rc = ioctl(vm_fd, KVM_CREATE_DEVICE, &arm_vgic);
-    if (rc == -1) {
-        perror("KVM_CREATE_DEVICE");
-        exit(EXIT_FAILURE);
-    }
-
-    configure_arm_vgic(arm_vgic.fd);
-
-    init_virtio_blk_device(&blk_dev);
-
     struct kvm_vcpu_init vcpu_init;
     memset(&vcpu_init, 0, sizeof(vcpu_init));
     rc = ioctl(vm_fd, KVM_ARM_PREFERRED_TARGET, &vcpu_init);
@@ -241,6 +244,33 @@ int main (int argc, char *argv[]) {
         perror("KVM_ARM_VCPU_INIT");
         exit(EXIT_FAILURE);
     }
+
+    uint64_t initial_pc = 0x784;
+    struct kvm_one_reg one_reg = {
+        .id = KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM_CORE | KVM_REG_ARM_CORE_REG(regs.pc),
+        .addr = &initial_pc
+    };
+
+    rc = ioctl(vcpu_fd, KVM_SET_ONE_REG, &one_reg);
+    if (rc == -1) {
+        perror("KVM_SET_ONE_REG");
+        exit(EXIT_FAILURE);
+    }
+
+    // Create ARM vGIC (Generic Interrupt Controller)
+    arm_vgic = (struct kvm_create_device){
+        .type = KVM_DEV_TYPE_ARM_VGIC_V2
+    };
+    rc = ioctl(vm_fd, KVM_CREATE_DEVICE, &arm_vgic);
+    if (rc == -1) {
+        perror("KVM_CREATE_DEVICE");
+        exit(EXIT_FAILURE);
+    }
+
+    configure_arm_vgic(arm_vgic.fd);
+    init_arm_vgic(arm_vgic.fd);
+
+    init_virtio_blk_device(&blk_dev);
 
     while (1) {
         ioctl(vcpu_fd, KVM_RUN, NULL);

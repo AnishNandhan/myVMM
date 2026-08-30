@@ -61,6 +61,8 @@ typedef uint64_t le64;
 /* Arbitrary descriptor layouts. */
 #define VIRTIO_F_ANY_LAYOUT 27
 
+#define VIRTIO_MAX_QUEUE_SIZE 8
+
 /* Virtqueue descriptors: 16 bytes.
 * These can chain together via "next". */
 struct virtq_desc {
@@ -77,8 +79,9 @@ struct virtq_desc {
 struct virtq_avail {
     le16 flags;
     le16 idx;
-    le16 ring[];
-    /* Only if VIRTIO_F_EVENT_IDX: le16 used_event; */
+    le16 ring[VIRTIO_MAX_QUEUE_SIZE];
+    /* Only if VIRTIO_F_EVENT_IDX */
+    le16 used_event;
 };
 
 /* le32 is used here for ids for padding reasons. */
@@ -92,8 +95,9 @@ struct virtq_used_elem {
 struct virtq_used {
     le16 flags;
     le16 idx;
-    struct virtq_used_elem ring[];
-    /* Only if VIRTIO_F_EVENT_IDX: le16 avail_event; */
+    struct virtq_used_elem ring[VIRTIO_MAX_QUEUE_SIZE];
+    /* Only if VIRTIO_F_EVENT_IDX */
+    le16 avail_event;
 };
 
 struct virtq {

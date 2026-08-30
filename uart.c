@@ -27,6 +27,7 @@ struct uart_16550 {
 void uart_handler(struct mmio_access *mmio) {
     if (mmio->is_write) {
         char s[mmio->len + 1];
+        memcpy(s, mmio->data, mmio->len);
         s[mmio->len] = '\0';
         printf("%s", s);
     }
